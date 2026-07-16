@@ -259,13 +259,12 @@ namespace
                 std::find_if(
                     candidates.begin(),
                     candidates.end(),
-                    [delegateInstance, possibleOwner](
+                    [possibleOwner](
                         const MountOwnerCandidate& candidate)
                     {
+                        // I treat copied delegates as the same candidate when
+                        // they still point to the same platform-file owner.
                         return
-                            candidate.delegateInstance ==
-                                reinterpret_cast<void*>(
-                                    delegateInstance) &&
                             candidate.platformFile ==
                                 reinterpret_cast<void*>(
                                     possibleOwner);
@@ -953,10 +952,32 @@ auto resolveMountFunctions() -> MountResolverResult
     }
 
     message
-        << "; owners="
+        << "; uniqueOwners="
         << ownerCandidates.size()
         << "; processMethodHits="
         << processMethodHits;
+
+    for (std::size_t index = 0;
+         index < ownerCandidates.size();
+         ++index)
+    {
+        const MountOwnerCandidate& candidate =
+            ownerCandidates[index];
+
+        message
+            << "; ownerCandidate"
+            << (index + 1)
+            << "="
+            << formatAddress(candidate.platformFile)
+            << "; delegateCandidate"
+            << (index + 1)
+            << "="
+            << formatAddress(candidate.delegateInstance)
+            << "; candidateMethodOffset"
+            << (index + 1)
+            << "="
+            << candidate.methodOffset;
+    }
 
     if (ownerCandidates.size() != 1)
     {
