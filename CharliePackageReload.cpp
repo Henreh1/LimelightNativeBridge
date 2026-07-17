@@ -22,6 +22,48 @@ namespace
 
     std::atomic_uint64_t releasedPackageNumber{0};
 
+    template <typename Character>
+    constexpr auto lowerAscii(
+        Character character) -> Character
+    {
+        const Character upperA =
+            static_cast<Character>('A');
+
+        const Character upperZ =
+            static_cast<Character>('Z');
+
+        if (character >= upperA &&
+            character <= upperZ)
+        {
+            return static_cast<Character>(
+                character +
+                static_cast<Character>('a' - 'A'));
+        }
+
+        return character;
+    }
+
+    auto packagePathsEqual(
+        const RC::File::StringType& left,
+        const RC::File::StringType& right) -> bool
+    {
+        if (left.size() != right.size())
+        {
+            return false;
+        }
+
+        return std::equal(
+            left.begin(),
+            left.end(),
+            right.begin(),
+            [](const auto leftCharacter,
+               const auto rightCharacter)
+            {
+                return lowerAscii(leftCharacter) ==
+                    lowerAscii(rightCharacter);
+            });
+    }
+
     struct RenameInvocationResult
     {
         bool renamed{false};
@@ -340,7 +382,9 @@ auto releasePackages(
                     requestedPackages.end(),
                     [&](const RequestedPackage& requested)
                     {
-                        return requested.path == widePath;
+                        return packagePathsEqual(
+                            requested.path,
+                            widePath);
                     });
 
             if (!alreadyRequested)
@@ -388,7 +432,12 @@ auto releasePackages(
                 for (RequestedPackage& requested :
                      requestedPackages)
                 {
-                    if (requested.path == packageName)
+                    // Unreal treats package names without regard to case. I
+                    // match them the same way so Custom1 and custom1 release
+                    // the same cached material package during a live switch.
+                    if (packagePathsEqual(
+                            requested.path,
+                            packageName))
                     {
                         if (requested.package == nullptr)
                         {
