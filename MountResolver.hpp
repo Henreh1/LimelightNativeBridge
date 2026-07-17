@@ -8,6 +8,7 @@ struct MountResolverResult
     std::string message;
     void* platformFile{};
     void* mountFunction{};
+    void* unmountFunction{};
 };
 
 auto resolveMountFunctions() -> MountResolverResult;

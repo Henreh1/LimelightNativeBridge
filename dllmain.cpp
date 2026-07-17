@@ -328,7 +328,24 @@ private:
                 mountResult.message);
         }
         else if (pendingCommand->action ==
-            "release_charlie_package")
+                 "unmount_pak")
+        {
+            const LivePakUnmountResult unmountResult =
+                unmountLivePak(
+                    pendingCommand->pakPath);
+
+            Output::send<LogLevel::Normal>(
+                unmountResult.succeeded
+                    ? STR("[Limelight] A retired IoStore container was unmounted on the game thread.\n")
+                    : STR("[Limelight] A retired IoStore container could not be unmounted on the game thread.\n"));
+
+            writeResponse(
+                pendingCommand->requestId,
+                unmountResult.succeeded,
+                unmountResult.message);
+        }
+        else if (pendingCommand->action ==
+                 "release_charlie_package")
         {
             const CharliePackageReleaseResult releaseResult =
                 releaseCharliePackage();
@@ -506,6 +523,39 @@ private:
                         std::filesystem::path(
                             pakPathEntry->second),
                         mountOrder
+                    });
+
+                if (!queued)
+                {
+                    writeResponse(
+                        requestId,
+                        false,
+                        "Unreal is still processing the previous live-loader command");
+                }
+            }
+        }
+        else if (action == "unmount_pak")
+        {
+            const auto pakPathEntry =
+                command.find("pakPath");
+
+            if (pakPathEntry == command.end() ||
+                pakPathEntry->second.empty())
+            {
+                writeResponse(
+                    requestId,
+                    false,
+                    "The unmount command did not include a pak path");
+            }
+            else
+            {
+                const bool queued =
+                    queueUnrealCommand({
+                        requestId,
+                        action,
+                        {},
+                        std::filesystem::path(
+                            pakPathEntry->second)
                     });
 
                 if (!queued)

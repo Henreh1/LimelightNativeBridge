@@ -23,9 +23,20 @@ namespace
             const RC::Unreal::FString& pakPath,
             std::int32_t mountOrder);
 
+    using UnmountPakFunction =
+        bool (__fastcall*)(
+            void* platformFile,
+            const RC::Unreal::FString& pakPath);
+
     struct MountInvocationResult
     {
         void* mountedPak{};
+        unsigned long exceptionCode{};
+    };
+
+    struct UnmountInvocationResult
+    {
+        bool unmounted{false};
         unsigned long exceptionCode{};
     };
 
@@ -122,6 +133,32 @@ namespace
         {
             return {
                 nullptr,
+                GetExceptionCode()
+            };
+        }
+    }
+
+    auto invokeUnmount(
+        UnmountPakFunction unmountFunction,
+        void* platformFile,
+        const RC::Unreal::FString& pakPath)
+        -> UnmountInvocationResult
+    {
+        // Unreal's own unmount path cancels or waits for outstanding reads.
+        // The safety boundary still protects the game if its ABI changes.
+        __try
+        {
+            return {
+                unmountFunction(
+                    platformFile,
+                    pakPath),
+                0
+            };
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return {
+                false,
                 GetExceptionCode()
             };
         }
@@ -298,5 +335,116 @@ auto mountLivePak(
     return {
         true,
         "Unreal mounted the staged IoStore container successfully"
+    };
+}
+
+auto unmountLivePak(
+    const std::filesystem::path& pakPath) -> LivePakUnmountResult
+{
+    if (pakPath.empty() ||
+        !pakPath.is_absolute())
+    {
+        return {
+            false,
+            "The staged pak path must be absolute"
+        };
+    }
+
+    std::error_code pathError;
+
+    const std::filesystem::path stagingDirectory =
+        std::filesystem::weakly_canonical(
+            getStagingDirectory(),
+            pathError);
+
+    if (pathError ||
+        stagingDirectory.empty())
+    {
+        return {
+            false,
+            "Limelight's live staging directory could not be resolved"
+        };
+    }
+
+    pathError.clear();
+
+    const std::filesystem::path canonicalPakPath =
+        std::filesystem::weakly_canonical(
+            pakPath,
+            pathError);
+
+    if (pathError ||
+        !pathIsInside(
+            canonicalPakPath,
+            stagingDirectory))
+    {
+        return {
+            false,
+            "The pak is outside Limelight's live staging directory"
+        };
+    }
+
+    if (_wcsicmp(
+            canonicalPakPath.extension().c_str(),
+            L".pak") != 0)
+    {
+        return {
+            false,
+            "The staged file is not a pak archive"
+        };
+    }
+
+    const MountResolverResult resolver =
+        resolveMountFunctions();
+
+    if (!resolver.succeeded ||
+        resolver.platformFile == nullptr ||
+        resolver.unmountFunction == nullptr)
+    {
+        return {
+            false,
+            "Unmount resolver failed: " +
+                resolver.message
+        };
+    }
+
+    const std::wstring pakPathText =
+        canonicalPakPath.wstring();
+
+    const RC::Unreal::FString unrealPakPath(
+        pakPathText.c_str());
+
+    const auto unmountFunction =
+        reinterpret_cast<UnmountPakFunction>(
+            resolver.unmountFunction);
+
+    const UnmountInvocationResult invocation =
+        invokeUnmount(
+            unmountFunction,
+            resolver.platformFile,
+            unrealPakPath);
+
+    if (invocation.exceptionCode != 0)
+    {
+        return {
+            false,
+            "Unreal raised exception " +
+                formatExceptionCode(
+                    invocation.exceptionCode) +
+                " while unmounting the container"
+        };
+    }
+
+    if (!invocation.unmounted)
+    {
+        return {
+            false,
+            "Unreal could not find the staged IoStore container to unmount"
+        };
+    }
+
+    return {
+        true,
+        "Unreal unmounted the staged IoStore container successfully"
     };
 }

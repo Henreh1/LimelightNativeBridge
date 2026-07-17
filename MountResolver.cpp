@@ -551,18 +551,11 @@ namespace
         return true;
     }
 
-    auto findMountText(
-        const ImageView& image) -> std::uint8_t*
+    auto findWideText(
+        const ImageView& image,
+        const wchar_t* text,
+        std::size_t textSize) -> std::uint8_t*
     {
-        // Unreal keeps this text beside both pak-mount entry points, which
-        // gives us a reliable landmark without depending on fixed addresses.
-        constexpr wchar_t mountText[] =
-            L"Mounting pak file: %s \n";
-
-        constexpr std::size_t mountTextSize =
-            sizeof(mountText) -
-            sizeof(wchar_t);
-
         std::uintptr_t cursor = image.start;
 
         while (cursor < image.end)
@@ -594,13 +587,13 @@ namespace
                 protectionCanBeRead(memory.Protect))
             {
                 for (std::uintptr_t address = regionStart;
-                     address + mountTextSize <= regionEnd;
+                     address + textSize <= regionEnd;
                      ++address)
                 {
                     if (std::memcmp(
                             reinterpret_cast<const void*>(address),
-                            mountText,
-                            mountTextSize) == 0)
+                            text,
+                            textSize) == 0)
                     {
                         return reinterpret_cast<std::uint8_t*>(
                             address);
@@ -667,6 +660,34 @@ namespace
         return nullptr;
     }
 
+    auto findMountText(
+        const ImageView& image) -> std::uint8_t*
+    {
+        // Unreal keeps this text beside both pak-mount entry points, which
+        // gives us a reliable landmark without depending on fixed addresses.
+        constexpr wchar_t mountText[] =
+            L"Mounting pak file: %s \n";
+
+        return findWideText(
+            image,
+            mountText,
+            sizeof(mountText) - sizeof(wchar_t));
+    }
+
+    auto findUnmountText(
+        const ImageView& image) -> std::uint8_t*
+    {
+        // The unmount delegate has its own shipping-build message. I use it
+        // instead of assuming that Unreal placed the method beside MountPak.
+        constexpr wchar_t unmountText[] =
+            L"Unmounting pak file: %s \n";
+
+        return findWideText(
+            image,
+            unmountText,
+            sizeof(unmountText) - sizeof(wchar_t));
+    }
+
     auto findFunctionSize(
         const ImageView& image,
         const std::uint8_t* functionStart) -> std::size_t
@@ -714,9 +735,9 @@ namespace
         return static_cast<std::size_t>(-1);
     }
 
-    auto findMountFunctionStarts(
+    auto findReferencingFunctionStarts(
         const ImageView& image,
-        const std::uint8_t* mountText) ->
+        const std::uint8_t* markerText) ->
         std::vector<std::uint8_t*>
     {
         std::vector<std::uint8_t*> functions;
@@ -759,7 +780,7 @@ namespace
                             address);
 
                     // Look for a RIP-relative LEA instruction which points at
-                    // Unreal's mount message.
+                    // the Unreal message used as this resolver's landmark.
                     if (instruction[0] < 0x40 ||
                         instruction[0] > 0x4f ||
                         instruction[1] != 0x8d ||
@@ -783,7 +804,7 @@ namespace
 
                     if (referencedAddress !=
                         reinterpret_cast<std::uintptr_t>(
-                            mountText))
+                            markerText))
                     {
                         continue;
                     }
@@ -870,7 +891,7 @@ auto resolveMountFunctions() -> MountResolverResult
     }
 
     const std::vector<std::uint8_t*> functions =
-        findMountFunctionStarts(
+        findReferencingFunctionStarts(
             image,
             mountText);
 
@@ -927,6 +948,47 @@ auto resolveMountFunctions() -> MountResolverResult
         << formatRva(image, mountFunction)
         << "; selectedSize="
         << findFunctionSize(image, mountFunction);
+
+    std::uint8_t* unmountText =
+        findUnmountText(image);
+
+    if (unmountText == nullptr)
+    {
+        return {
+            false,
+            "Unreal's pak unmount marker was not found; " +
+                message.str()
+        };
+    }
+
+    const std::vector<std::uint8_t*> unmountFunctions =
+        findReferencingFunctionStarts(
+            image,
+            unmountText);
+
+    message
+        << "; unmountMarker="
+        << formatRva(image, unmountText)
+        << "; unmountFunctions="
+        << unmountFunctions.size();
+
+    if (unmountFunctions.size() != 1)
+    {
+        return {
+            false,
+            "Expected one Unreal unmount function; " +
+                message.str()
+        };
+    }
+
+    std::uint8_t* unmountFunction =
+        unmountFunctions.front();
+
+    message
+        << "; unmountSelected="
+        << formatRva(image, unmountFunction)
+        << "; unmountSelectedSize="
+        << findFunctionSize(image, unmountFunction);
 
     std::vector<MountOwnerCandidate> ownerCandidates =
         findMountOwnerCandidates(
@@ -1010,6 +1072,9 @@ auto resolveMountFunctions() -> MountResolverResult
 
     result.mountFunction =
         mountFunction;
+
+    result.unmountFunction =
+        unmountFunction;
 
     // These addresses remain valid until the game process closes, so keep
     // them ready for every live mount after the first successful scan.
