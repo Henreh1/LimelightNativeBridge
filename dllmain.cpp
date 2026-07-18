@@ -13,7 +13,9 @@
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
+#include <Unreal/FWorldContext.hpp>
 #include <Unreal/Hooks/Hooks.hpp>
+#include <Unreal/World.hpp>
 #include "MountResolver.hpp"
 #include "LivePakMount.hpp"
 #include "CharliePackageReload.hpp"
@@ -46,6 +48,8 @@ private:
     std::optional<PendingUnrealCommand> m_pendingUnrealCommand;
     std::atomic_bool m_worldTransitioning{false};
     std::atomic_bool m_worldSettling{false};
+    std::atomic_bool m_worldUnsafe{true};
+    Unreal::UWorld* m_currentWorld{nullptr};
     std::chrono::steady_clock::time_point m_worldReadyAfter{};
     Unreal::Hook::GlobalCallbackId m_engineTickCallbackId{
         Unreal::Hook::ERROR_ID};
@@ -279,7 +283,78 @@ private:
     auto isWorldChangeInProgress() const -> bool
     {
         return m_worldTransitioning.load() ||
-               m_worldSettling.load();
+               m_worldSettling.load() ||
+               m_worldUnsafe.load();
+    }
+
+    auto refreshCurrentWorldSafetyState() -> void
+    {
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        if (m_worldTransitioning.load() ||
+            m_currentWorld == nullptr)
+        {
+            m_worldUnsafe.store(true);
+            m_worldSettling.store(true);
+            return;
+        }
+
+        bool worldIsUnsafe = true;
+
+        try
+        {
+            // Some Dead as Disco screens stream levels without calling
+            // LoadMap. These live UWorld flags close that second gap before I
+            // let a mount or package release touch Unreal's object system.
+            worldIsUnsafe =
+                static_cast<bool>(
+                    m_currentWorld->GetbIsTearingDown()) ||
+                m_currentWorld->GetbIsBeingCleanedUp() ||
+                m_currentWorld
+                        ->GetIsInBlockTillLevelStreamingCompleted() != 0 ||
+                m_currentWorld
+                        ->GetNumStreamingLevelsBeingLoaded() != 0 ||
+                static_cast<bool>(
+                    m_currentWorld
+                        ->GetbRequestedBlockOnAsyncLoading()) ||
+                !static_cast<bool>(
+                    m_currentWorld->GetbIsWorldInitialized()) ||
+                !static_cast<bool>(
+                    m_currentWorld->GetbActorsInitialized());
+        }
+        catch (...)
+        {
+            // An unreadable world is never a reason to risk a live package
+            // mutation. The next healthy game tick can open the gate again.
+            worldIsUnsafe = true;
+        }
+
+        const bool worldWasUnsafe =
+            m_worldUnsafe.exchange(
+                worldIsUnsafe);
+
+        if (worldIsUnsafe)
+        {
+            if (!worldWasUnsafe)
+            {
+                // A streamed teardown can start without LoadMap. If that
+                // happens after a command was accepted, I cancel it here so
+                // an old X19 key press cannot wake up in the next level.
+                cancelPendingUnrealCommandForTransition();
+            }
+
+            m_worldSettling.store(true);
+            m_worldReadyAfter =
+                now +
+                std::chrono::seconds(6);
+            return;
+        }
+
+        if (now >= m_worldReadyAfter)
+        {
+            m_worldSettling.store(false);
+        }
     }
 
     auto cancelPendingUnrealCommandForTransition() -> void
@@ -312,6 +387,7 @@ private:
     auto processPendingUnrealCommand() -> void
     {
         if (m_worldTransitioning.load() ||
+            m_worldUnsafe.load() ||
             std::chrono::steady_clock::now() <
                 m_worldReadyAfter)
         {
@@ -818,6 +894,7 @@ public:
                        float,
                        bool)
                 {
+                    refreshCurrentWorldSafetyState();
                     processPendingUnrealCommand();
                 },
                 {
@@ -838,6 +915,8 @@ public:
                 {
                     m_worldTransitioning.store(true);
                     m_worldSettling.store(true);
+                    m_worldUnsafe.store(true);
+                    m_currentWorld = nullptr;
 
                     cancelPendingUnrealCommandForTransition();
 
@@ -855,13 +934,16 @@ public:
             Unreal::Hook::RegisterLoadMapPostCallback(
                 [this](auto&,
                        Unreal::UEngine*,
-                       Unreal::FWorldContext&,
+                       Unreal::FWorldContext& worldContext,
                        Unreal::FURL,
                        Unreal::UPendingNetGame*,
                        Unreal::FString&)
                 {
                     m_worldTransitioning.store(false);
                     m_worldSettling.store(true);
+                    m_worldUnsafe.store(true);
+                    m_currentWorld =
+                        worldContext.GetThisCurrentWorld();
 
                     // Give streamed actors and preview components a moment to
                     // finish registering before a queued live refresh resumes.
