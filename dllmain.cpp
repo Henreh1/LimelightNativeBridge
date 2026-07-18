@@ -276,6 +276,39 @@ private:
         return true;
     }
 
+    auto isWorldChangeInProgress() const -> bool
+    {
+        return m_worldTransitioning.load() ||
+               m_worldSettling.load();
+    }
+
+    auto cancelPendingUnrealCommandForTransition() -> void
+    {
+        std::optional<PendingUnrealCommand> cancelledCommand;
+
+        {
+            std::scoped_lock lock(
+                m_pendingUnrealCommandMutex);
+
+            if (!m_pendingUnrealCommand.has_value())
+            {
+                return;
+            }
+
+            cancelledCommand =
+                std::move(m_pendingUnrealCommand);
+
+            m_pendingUnrealCommand.reset();
+        }
+
+        // A command accepted just before LoadMap must not wake up after the
+        // new world appears. Limelight will ask the user to try again instead.
+        writeResponse(
+            cancelledCommand->requestId,
+            false,
+            "Dead as Disco started changing levels before the live change could begin");
+    }
+
     auto processPendingUnrealCommand() -> void
     {
         if (m_worldTransitioning.load() ||
@@ -468,6 +501,27 @@ private:
         const std::string& action =
             actionEntry->second;
 
+        const bool mutatesUnrealState =
+            action == "mount_pak" ||
+            action == "unmount_pak" ||
+            action == "release_charlie_package" ||
+            action == "release_packages";
+
+        if (mutatesUnrealState &&
+            isWorldChangeInProgress())
+        {
+            writeResponse(
+                requestId,
+                false,
+                "Dead as Disco is changing levels, so live mod switching is temporarily locked");
+
+            std::filesystem::remove(
+                commandPath,
+                fileError);
+
+            return;
+        }
+
         if (action == "ping")
         {
             Output::send<LogLevel::Normal>(
@@ -477,6 +531,18 @@ private:
                 requestId,
                 true,
                 "Limelight native bridge is online");
+        }
+        else if (action == "is_world_stable")
+        {
+            const bool worldIsStable =
+                !isWorldChangeInProgress();
+
+            writeResponse(
+                requestId,
+                worldIsStable,
+                worldIsStable
+                    ? "Unreal's world is stable."
+                    : "Dead as Disco is changing levels, so live mod switching is temporarily locked.");
         }
         else if (action == "can_switch_mods")
         {
@@ -493,8 +559,7 @@ private:
                     m_nextLiveSwitchAfterMilliseconds.load();
 
             const bool canSwitch =
-                !m_worldTransitioning.load() &&
-                !m_worldSettling.load() &&
+                !isWorldChangeInProgress() &&
                 cooldownReady &&
                 retirementStatus.ready;
 
@@ -505,8 +570,7 @@ private:
                 message =
                     "Unreal is ready for a live mod change.";
             }
-            else if (m_worldTransitioning.load() ||
-                     m_worldSettling.load())
+            else if (isWorldChangeInProgress())
             {
                 message =
                     "Dead as Disco is changing levels, so live mod switching is temporarily locked.";
@@ -704,7 +768,7 @@ public:
     LimelightNativeBridge() : CppUserModBase()
     {
         ModName = STR("LimelightNativeBridge");
-        ModVersion = STR("0.1.0");
+        ModVersion = STR("0.1.6");
         ModDescription = STR("Native live-loading support for Limelight.");
         ModAuthors = STR("Limelight Team");
 
@@ -775,6 +839,8 @@ public:
                     m_worldTransitioning.store(true);
                     m_worldSettling.store(true);
 
+                    cancelPendingUnrealCommandForTransition();
+
                     Output::send<LogLevel::Normal>(
                         STR("[Limelight] Level transition started; live changes will wait.\n"));
                 },
@@ -801,7 +867,7 @@ public:
                     // finish registering before a queued live refresh resumes.
                     m_worldReadyAfter =
                         std::chrono::steady_clock::now() +
-                        std::chrono::seconds(2);
+                        std::chrono::seconds(6);
 
                     Output::send<LogLevel::Normal>(
                         STR("[Limelight] Level transition finished; queued live changes may resume shortly.\n"));
