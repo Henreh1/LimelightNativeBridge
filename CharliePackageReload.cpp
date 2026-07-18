@@ -32,6 +32,12 @@ namespace
     constexpr auto MaximumRetirementAge =
         std::chrono::seconds(30);
 
+    // I keep retired live assets rooted for the rest of this game session.
+    // Unreal can retain render-thread references across a level change even
+    // after its UObject references appear unused. Releasing these roots on a
+    // timer caused access violations while a new Charlie was being created.
+    constexpr bool ReleaseRetiredRootsDuringSession = false;
+
     struct RetiredPackageGeneration
     {
         std::chrono::steady_clock::time_point retiredAt;
@@ -142,6 +148,11 @@ namespace
 
     auto makeRetirementRoom() -> bool
     {
+        if constexpr (!ReleaseRetiredRootsDuringSession)
+        {
+            return true;
+        }
+
         std::scoped_lock lock(
             retiredPackageMutex);
 
@@ -203,6 +214,13 @@ namespace
     {
         if (rootedObjects.empty())
         {
+            return;
+        }
+
+        if constexpr (!ReleaseRetiredRootsDuringSession)
+        {
+            // The root flags remain owned by Limelight until the process
+            // closes. I discard only the bookkeeping vector here.
             return;
         }
 
@@ -771,6 +789,11 @@ auto releasePackages(
 auto getPackageRetirementStatus()
     -> PackageRetirementStatus
 {
+    if constexpr (!ReleaseRetiredRootsDuringSession)
+    {
+        return {};
+    }
+
     std::scoped_lock lock(
         retiredPackageMutex);
 
@@ -812,6 +835,11 @@ auto getPackageRetirementStatus()
 auto cleanupRetiredPackages()
     -> PackageRetirementCleanupResult
 {
+    if constexpr (!ReleaseRetiredRootsDuringSession)
+    {
+        return {};
+    }
+
     std::scoped_lock lock(
         retiredPackageMutex);
 
