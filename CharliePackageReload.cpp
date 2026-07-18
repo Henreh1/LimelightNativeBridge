@@ -3,10 +3,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 #include <Constructs/Loop.hpp>
@@ -21,6 +25,21 @@ namespace
         STR("/Game/Pagoda/Characters/Player/Meshes/SK_Charlie");
 
     std::atomic_uint64_t releasedPackageNumber{0};
+
+    constexpr std::size_t MaxRetiredGenerations = 3;
+    constexpr auto MinimumRetirementAge =
+        std::chrono::seconds(8);
+    constexpr auto MaximumRetirementAge =
+        std::chrono::seconds(30);
+
+    struct RetiredPackageGeneration
+    {
+        std::chrono::steady_clock::time_point retiredAt;
+        std::vector<RC::Unreal::UObject*> rootedObjects;
+    };
+
+    std::mutex retiredPackageMutex;
+    std::deque<RetiredPackageGeneration> retiredPackageGenerations;
 
     template <typename Character>
     constexpr auto lowerAscii(
@@ -69,6 +88,132 @@ namespace
         bool renamed{false};
         unsigned long exceptionCode{};
     };
+
+    auto invokeClearRoot(
+        RC::Unreal::UObject* object) -> bool
+    {
+        if (object == nullptr)
+        {
+            return true;
+        }
+
+        // Clearing a root only makes the object eligible for normal Unreal
+        // collection. I keep this behind an exception boundary because this
+        // code runs inside the game process.
+        __try
+        {
+            if (object->IsRootSet())
+            {
+                object->ClearRootSet();
+            }
+
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    auto clearGeneration(
+        RetiredPackageGeneration& generation) -> std::size_t
+    {
+        std::size_t objectsUnrooted = 0;
+        std::vector<RC::Unreal::UObject*> rootsStillOwned;
+
+        for (RC::Unreal::UObject* object :
+             generation.rootedObjects)
+        {
+            if (invokeClearRoot(object))
+            {
+                ++objectsUnrooted;
+            }
+            else
+            {
+                rootsStillOwned.push_back(object);
+            }
+        }
+
+        generation.rootedObjects =
+            std::move(rootsStillOwned);
+
+        return objectsUnrooted;
+    }
+
+    auto makeRetirementRoom() -> bool
+    {
+        std::scoped_lock lock(
+            retiredPackageMutex);
+
+        if (retiredPackageGenerations.size() <
+            MaxRetiredGenerations)
+        {
+            return true;
+        }
+
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        RetiredPackageGeneration& oldest =
+            retiredPackageGenerations.front();
+
+        if (now - oldest.retiredAt <
+            MinimumRetirementAge)
+        {
+            return false;
+        }
+
+        clearGeneration(oldest);
+
+        if (!oldest.rootedObjects.empty())
+        {
+            return false;
+        }
+
+        retiredPackageGenerations.pop_front();
+
+        return true;
+    }
+
+    auto rootForRetirement(
+        RC::Unreal::UObject* object,
+        std::vector<RC::Unreal::UObject*>& rootedObjects,
+        std::unordered_set<RC::Unreal::UObject*>& seenObjects)
+        -> void
+    {
+        if (object == nullptr ||
+            seenObjects.contains(object))
+        {
+            return;
+        }
+
+        seenObjects.insert(object);
+
+        // I only remember roots that Limelight added. Objects already rooted
+        // by the game must stay under the game's ownership.
+        if (!object->IsRootSet())
+        {
+            object->SetRootSet();
+            rootedObjects.push_back(object);
+        }
+    }
+
+    auto commitRetiredGeneration(
+        std::vector<RC::Unreal::UObject*> rootedObjects) -> void
+    {
+        if (rootedObjects.empty())
+        {
+            return;
+        }
+
+        std::scoped_lock lock(
+            retiredPackageMutex);
+
+        retiredPackageGenerations.push_back({
+            std::chrono::steady_clock::now(),
+            std::move(rootedObjects)
+        });
+    }
 
     auto invokeRename(
         RC::Unreal::UObject* package,
@@ -243,6 +388,14 @@ auto releaseCharliePackage()
             };
         }
 
+        if (!makeRetirementRoom())
+        {
+            return {
+                false,
+                "The previous live assets are still settling; try again in a few seconds"
+            };
+        }
+
         std::vector<RC::Unreal::UObject*> objectsToRetain;
 
         RC::Unreal::UObjectGlobals::ForEachUObject(
@@ -260,19 +413,21 @@ auto releaseCharliePackage()
                 return RC::LoopAction::Continue;
             });
 
-        if (!package->IsRootSet())
-        {
-            package->SetRootSet();
-        }
+        std::vector<RC::Unreal::UObject*> rootedObjects;
+        std::unordered_set<RC::Unreal::UObject*> seenObjects;
+
+        rootForRetirement(
+            package,
+            rootedObjects,
+            seenObjects);
 
         for (RC::Unreal::UObject* retainedObject :
              objectsToRetain)
         {
-            if (retainedObject != nullptr &&
-                !retainedObject->IsRootSet())
-            {
-                retainedObject->SetRootSet();
-            }
+            rootForRetirement(
+                retainedObject,
+                rootedObjects,
+                seenObjects);
         }
 
         RC::File::StringType releasedPackageName =
@@ -300,6 +455,9 @@ auto releaseCharliePackage()
 
         if (invocation.exceptionCode != 0)
         {
+            commitRetiredGeneration(
+                std::move(rootedObjects));
+
             return {
                 false,
                 "Unreal raised exception " +
@@ -311,11 +469,17 @@ auto releaseCharliePackage()
 
         if (!invocation.renamed)
         {
+            commitRetiredGeneration(
+                std::move(rootedObjects));
+
             return {
                 false,
                 "Unreal refused to release the cached Charlie package"
             };
         }
+
+        commitRetiredGeneration(
+            std::move(rootedObjects));
 
         return {
             true,
@@ -454,6 +618,26 @@ auto releasePackages(
                 return RC::LoopAction::Continue;
             });
 
+        const bool hasLoadedPackage =
+            std::any_of(
+                requestedPackages.begin(),
+                requestedPackages.end(),
+                [](const RequestedPackage& requested)
+                {
+                    return requested.package != nullptr;
+                });
+
+        if (hasLoadedPackage &&
+            !makeRetirementRoom())
+        {
+            return {
+                false,
+                0,
+                0,
+                "The previous live assets are still settling; try again in a few seconds"
+            };
+        }
+
         const auto renameFlags =
             static_cast<RC::Unreal::ERenameFlags>(
                 REN_DoNotDirty |
@@ -463,6 +647,8 @@ auto releasePackages(
 
         std::size_t releasedCount = 0;
         std::size_t notLoadedCount = 0;
+        std::vector<RC::Unreal::UObject*> rootedObjects;
+        std::unordered_set<RC::Unreal::UObject*> seenObjects;
 
         for (RequestedPackage& requested :
              requestedPackages)
@@ -474,23 +660,24 @@ auto releasePackages(
             }
 
             // A renderer or preview scene can still hold the previous mesh,
-            // material, or texture for a few frames. Keep every export from
-            // the old package alive for this game session so a later map load
-            // cannot collect an object that Unreal is still finishing with.
-            if (!requested.package->IsRootSet())
-            {
-                requested.package->SetRootSet();
-            }
+            // material, or texture briefly. I keep a bounded generation alive
+            // while those references settle, then return it to Unreal.
+            rootForRetirement(
+                requested.package,
+                rootedObjects,
+                seenObjects);
 
             for (RC::Unreal::UObject* retainedObject :
                  objectsToRetain)
             {
                 if (retainedObject != nullptr &&
                     retainedObject->GetOutermost() ==
-                        requested.package &&
-                    !retainedObject->IsRootSet())
+                        requested.package)
                 {
-                    retainedObject->SetRootSet();
+                    rootForRetirement(
+                        retainedObject,
+                        rootedObjects,
+                        seenObjects);
                 }
             }
 
@@ -512,6 +699,9 @@ auto releasePackages(
 
             if (invocation.exceptionCode != 0)
             {
+                commitRetiredGeneration(
+                    std::move(rootedObjects));
+
                 return {
                     false,
                     releasedCount,
@@ -527,6 +717,9 @@ auto releasePackages(
 
             if (!invocation.renamed)
             {
+                commitRetiredGeneration(
+                    std::move(rootedObjects));
+
                 return {
                     false,
                     releasedCount,
@@ -539,6 +732,9 @@ auto releasePackages(
 
             ++releasedCount;
         }
+
+        commitRetiredGeneration(
+            std::move(rootedObjects));
 
         return {
             true,
@@ -570,4 +766,81 @@ auto releasePackages(
             "Character package refresh failed with an unknown error"
         };
     }
+}
+
+auto getPackageRetirementStatus()
+    -> PackageRetirementStatus
+{
+    std::scoped_lock lock(
+        retiredPackageMutex);
+
+    PackageRetirementStatus status;
+    status.retainedGenerations =
+        retiredPackageGenerations.size();
+
+    if (retiredPackageGenerations.size() <
+        MaxRetiredGenerations)
+    {
+        return status;
+    }
+
+    const auto now =
+        std::chrono::steady_clock::now();
+
+    const auto age =
+        now - retiredPackageGenerations.front().retiredAt;
+
+    if (age >= MinimumRetirementAge)
+    {
+        return status;
+    }
+
+    const auto wait =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            MinimumRetirementAge - age);
+
+    status.ready = false;
+    status.retryAfterMilliseconds =
+        static_cast<std::uint32_t>(
+            std::max<std::int64_t>(
+                1,
+                wait.count()));
+
+    return status;
+}
+
+auto cleanupRetiredPackages()
+    -> PackageRetirementCleanupResult
+{
+    std::scoped_lock lock(
+        retiredPackageMutex);
+
+    PackageRetirementCleanupResult result;
+    const auto now =
+        std::chrono::steady_clock::now();
+
+    while (!retiredPackageGenerations.empty())
+    {
+        RetiredPackageGeneration& oldest =
+            retiredPackageGenerations.front();
+
+        if (now - oldest.retiredAt <
+            MaximumRetirementAge)
+        {
+            break;
+        }
+
+        result.objectsUnrooted +=
+            clearGeneration(oldest);
+
+        if (!oldest.rootedObjects.empty())
+        {
+            break;
+        }
+
+        retiredPackageGenerations.pop_front();
+        ++result.generationsReleased;
+    }
+
+    return result;
 }

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(
     LimelightNativeBridge
-    VERSION 0.1.3
+    VERSION 0.1.4
     LANGUAGES CXX
 )
 

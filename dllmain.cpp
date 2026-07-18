@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -37,6 +38,8 @@ private:
     std::filesystem::path m_runtimeDirectory;
     std::chrono::steady_clock::time_point m_nextHeartbeat{};
     std::chrono::steady_clock::time_point m_nextCommandCheck{};
+    std::chrono::steady_clock::time_point m_nextRetiredPackageCleanup{};
+    std::atomic<std::int64_t> m_nextLiveSwitchAfterMilliseconds{0};
     std::string m_lastRequestId;
     bool m_runtimeDirectoryReady{false};
     std::mutex m_pendingUnrealCommandMutex;
@@ -289,6 +292,25 @@ private:
         // period has passed. Manual live changes can be offered again.
         m_worldSettling.store(false);
 
+        const auto currentTime =
+            std::chrono::steady_clock::now();
+
+        if (currentTime >= m_nextRetiredPackageCleanup)
+        {
+            const PackageRetirementCleanupResult cleanupResult =
+                cleanupRetiredPackages();
+
+            if (cleanupResult.generationsReleased > 0)
+            {
+                Output::send<LogLevel::Normal>(
+                    STR("[Limelight] Retired live assets were returned to Unreal's garbage collector.\n"));
+            }
+
+            m_nextRetiredPackageCleanup =
+                currentTime +
+                std::chrono::seconds(1);
+        }
+
         std::optional<PendingUnrealCommand> pendingCommand;
 
         {
@@ -326,6 +348,19 @@ private:
                 pendingCommand->requestId,
                 mountResult.succeeded,
                 mountResult.message);
+
+            if (mountResult.succeeded)
+            {
+                // A small pause keeps rapid X19 taps from stacking package
+                // retirement work faster than Unreal can settle it.
+                const auto nowMilliseconds =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+
+                m_nextLiveSwitchAfterMilliseconds.store(
+                    nowMilliseconds + 3000);
+            }
         }
         else if (pendingCommand->action ==
                  "unmount_pak")
@@ -445,16 +480,52 @@ private:
         }
         else if (action == "can_switch_mods")
         {
+            const PackageRetirementStatus retirementStatus =
+                getPackageRetirementStatus();
+
+            const auto nowMilliseconds =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+
+            const bool cooldownReady =
+                nowMilliseconds >=
+                    m_nextLiveSwitchAfterMilliseconds.load();
+
             const bool canSwitch =
                 !m_worldTransitioning.load() &&
-                !m_worldSettling.load();
+                !m_worldSettling.load() &&
+                cooldownReady &&
+                retirementStatus.ready;
+
+            std::string message;
+
+            if (canSwitch)
+            {
+                message =
+                    "Unreal is ready for a live mod change.";
+            }
+            else if (m_worldTransitioning.load() ||
+                     m_worldSettling.load())
+            {
+                message =
+                    "Dead as Disco is changing levels, so live mod switching is temporarily locked.";
+            }
+            else if (!cooldownReady)
+            {
+                message =
+                    "The previous X19 switch is still settling; try again in a moment.";
+            }
+            else
+            {
+                message =
+                    "The previous live assets are still retiring; try again in a few seconds.";
+            }
 
             writeResponse(
                 requestId,
                 canSwitch,
-                canSwitch
-                    ? "Unreal is ready for a live mod change."
-                    : "Dead as Disco is changing levels, so live mod switching is temporarily locked.");
+                message);
         }
         else if (action == "resolve_mount")
         {
