@@ -44,6 +44,7 @@ private:
     std::atomic<std::int64_t> m_nextLiveSwitchAfterMilliseconds{0};
     std::string m_lastRequestId;
     bool m_runtimeDirectoryReady{false};
+    std::mutex m_runtimeServiceMutex;
     std::mutex m_pendingUnrealCommandMutex;
     std::optional<PendingUnrealCommand> m_pendingUnrealCommand;
     std::atomic_bool m_worldTransitioning{false};
@@ -840,11 +841,53 @@ private:
             fileError);
     }
 
+    auto serviceRuntimeBridge() -> void
+    {
+        if (!m_runtimeDirectoryReady)
+        {
+            return;
+        }
+
+        // UE4SS normally calls on_update for us. Some launches stop
+        // delivering that callback after Unreal finishes starting, so the
+        // engine tick hook also calls this method as a dependable fallback.
+        // The lock keeps both paths from reading the same command together.
+        std::unique_lock runtimeLock(
+            m_runtimeServiceMutex,
+            std::try_to_lock);
+
+        if (!runtimeLock.owns_lock())
+        {
+            return;
+        }
+
+        const auto currentTime =
+            std::chrono::steady_clock::now();
+
+        if (currentTime >= m_nextHeartbeat)
+        {
+            writeHeartbeat();
+
+            m_nextHeartbeat =
+                currentTime +
+                std::chrono::seconds(1);
+        }
+
+        if (currentTime >= m_nextCommandCheck)
+        {
+            processCommand();
+
+            m_nextCommandCheck =
+                currentTime +
+                std::chrono::milliseconds(100);
+        }
+    }
+
 public:
     LimelightNativeBridge() : CppUserModBase()
     {
         ModName = STR("LimelightNativeBridge");
-        ModVersion = STR("0.1.6");
+        ModVersion = STR("0.1.8");
         ModDescription = STR("Native live-loading support for Limelight.");
         ModAuthors = STR("Limelight Team");
 
@@ -894,6 +937,7 @@ public:
                        float,
                        bool)
                 {
+                    serviceRuntimeBridge();
                     refreshCurrentWorldSafetyState();
                     processPendingUnrealCommand();
                 },
@@ -981,32 +1025,7 @@ public:
 
     auto on_update() -> void override
     {
-        if (!m_runtimeDirectoryReady)
-        {
-            return;
-        }
-
-        const auto currentTime =
-            std::chrono::steady_clock::now();
-
-        if (currentTime >= m_nextHeartbeat)
-        {
-            // There is no reason to touch the heartbeat on every game frame.
-            writeHeartbeat();
-
-            m_nextHeartbeat =
-                currentTime +
-                std::chrono::seconds(1);
-        }
-
-        if (currentTime >= m_nextCommandCheck)
-        {
-            processCommand();
-
-            m_nextCommandCheck =
-                currentTime +
-                std::chrono::milliseconds(100);
-        }
+        serviceRuntimeBridge();
     }
 };
 
