@@ -668,6 +668,18 @@ private:
                 canSwitch,
                 message);
         }
+        else if (action == "confirm_package_retirement")
+        {
+            const std::size_t confirmedGenerations =
+                confirmPackageRetirement();
+
+            writeResponse(
+                requestId,
+                true,
+                "Confirmed " +
+                    std::to_string(confirmedGenerations) +
+                    " retired live-asset generations for safe cleanup.");
+        }
         else if (action == "resolve_mount")
         {
             const MountResolverResult resolverResult =
@@ -887,7 +899,7 @@ public:
     LimelightNativeBridge() : CppUserModBase()
     {
         ModName = STR("LimelightNativeBridge");
-        ModVersion = STR("0.1.8");
+        ModVersion = STR("0.1.9");
         ModDescription = STR("Native live-loading support for Limelight.");
         ModAuthors = STR("Limelight Team");
 

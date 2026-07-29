@@ -26,22 +26,18 @@ namespace
 
     std::atomic_uint64_t releasedPackageNumber{0};
 
-    constexpr std::size_t MaxRetiredGenerations = 3;
+    constexpr std::size_t MaxRetiredGenerations = 4;
+    constexpr std::size_t RetainedGenerationFloor = 2;
     constexpr auto MinimumRetirementAge =
-        std::chrono::seconds(8);
+        std::chrono::seconds(12);
     constexpr auto MaximumRetirementAge =
-        std::chrono::seconds(30);
-
-    // I keep retired live assets rooted for the rest of this game session.
-    // Unreal can retain render-thread references across a level change even
-    // after its UObject references appear unused. Releasing these roots on a
-    // timer caused access violations while a new Charlie was being created.
-    constexpr bool ReleaseRetiredRootsDuringSession = false;
+        std::chrono::seconds(60);
 
     struct RetiredPackageGeneration
     {
         std::chrono::steady_clock::time_point retiredAt;
         std::vector<RC::Unreal::UObject*> rootedObjects;
+        bool replacementConfirmed{false};
     };
 
     std::mutex retiredPackageMutex;
@@ -148,11 +144,6 @@ namespace
 
     auto makeRetirementRoom() -> bool
     {
-        if constexpr (!ReleaseRetiredRootsDuringSession)
-        {
-            return true;
-        }
-
         std::scoped_lock lock(
             retiredPackageMutex);
 
@@ -168,7 +159,11 @@ namespace
         RetiredPackageGeneration& oldest =
             retiredPackageGenerations.front();
 
-        if (now - oldest.retiredAt <
+        // I only release a generation after Limelight has verified the new
+        // player mesh and its materials. This keeps a failed handoff rooted
+        // and turns it into a safe restart instead of a render-thread crash.
+        if (!oldest.replacementConfirmed ||
+            now - oldest.retiredAt <
             MinimumRetirementAge)
         {
             return false;
@@ -217,19 +212,13 @@ namespace
             return;
         }
 
-        if constexpr (!ReleaseRetiredRootsDuringSession)
-        {
-            // The root flags remain owned by Limelight until the process
-            // closes. I discard only the bookkeeping vector here.
-            return;
-        }
-
         std::scoped_lock lock(
             retiredPackageMutex);
 
         retiredPackageGenerations.push_back({
             std::chrono::steady_clock::now(),
-            std::move(rootedObjects)
+            std::move(rootedObjects),
+            false
         });
     }
 
@@ -789,11 +778,6 @@ auto releasePackages(
 auto getPackageRetirementStatus()
     -> PackageRetirementStatus
 {
-    if constexpr (!ReleaseRetiredRootsDuringSession)
-    {
-        return {};
-    }
-
     std::scoped_lock lock(
         retiredPackageMutex);
 
@@ -813,8 +797,19 @@ auto getPackageRetirementStatus()
     const auto age =
         now - retiredPackageGenerations.front().retiredAt;
 
-    if (age >= MinimumRetirementAge)
+    const RetiredPackageGeneration& oldest =
+        retiredPackageGenerations.front();
+
+    if (oldest.replacementConfirmed &&
+        age >= MinimumRetirementAge)
     {
+        return status;
+    }
+
+    if (!oldest.replacementConfirmed)
+    {
+        status.ready = false;
+        status.retryAfterMilliseconds = 1000;
         return status;
     }
 
@@ -832,14 +827,33 @@ auto getPackageRetirementStatus()
     return status;
 }
 
+auto confirmPackageRetirement()
+    -> std::size_t
+{
+    std::scoped_lock lock(
+        retiredPackageMutex);
+
+    std::size_t confirmedGenerations = 0;
+
+    // A successful Lua handoff proves that the active player is using the
+    // replacement mesh and real mod materials. Earlier roots can now age out
+    // while the newest two generations remain available as a safety buffer.
+    for (RetiredPackageGeneration& generation :
+         retiredPackageGenerations)
+    {
+        if (!generation.replacementConfirmed)
+        {
+            generation.replacementConfirmed = true;
+            ++confirmedGenerations;
+        }
+    }
+
+    return confirmedGenerations;
+}
+
 auto cleanupRetiredPackages()
     -> PackageRetirementCleanupResult
 {
-    if constexpr (!ReleaseRetiredRootsDuringSession)
-    {
-        return {};
-    }
-
     std::scoped_lock lock(
         retiredPackageMutex);
 
@@ -847,12 +861,14 @@ auto cleanupRetiredPackages()
     const auto now =
         std::chrono::steady_clock::now();
 
-    while (!retiredPackageGenerations.empty())
+    while (retiredPackageGenerations.size() >
+           RetainedGenerationFloor)
     {
         RetiredPackageGeneration& oldest =
             retiredPackageGenerations.front();
 
-        if (now - oldest.retiredAt <
+        if (!oldest.replacementConfirmed ||
+            now - oldest.retiredAt <
             MaximumRetirementAge)
         {
             break;

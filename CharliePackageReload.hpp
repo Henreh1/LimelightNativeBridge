@@ -42,5 +42,8 @@ auto releasePackages(
 auto getPackageRetirementStatus()
     -> PackageRetirementStatus;
 
+auto confirmPackageRetirement()
+    -> std::size_t;
+
 auto cleanupRetiredPackages()
     -> PackageRetirementCleanupResult;
