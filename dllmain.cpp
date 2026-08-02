@@ -899,7 +899,7 @@ public:
     LimelightNativeBridge() : CppUserModBase()
     {
         ModName = STR("LimelightNativeBridge");
-        ModVersion = STR("0.1.9");
+        ModVersion = STR("0.1.10");
         ModDescription = STR("Native live-loading support for Limelight.");
         ModAuthors = STR("Limelight Team");
 

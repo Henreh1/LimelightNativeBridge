@@ -136,14 +136,34 @@ namespace
             address + size <= regionEnd;
     }
 
+    auto tryReadMemory(
+        std::uintptr_t address,
+        void* destination,
+        std::size_t size) -> bool
+    {
+        SIZE_T bytesRead = 0;
+
+        // Unreal can release or protect a page between VirtualQuery and the
+        // actual read. ReadProcessMemory turns that race into a clean failure
+        // instead of allowing the resolver to crash inside the game process.
+        return
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                reinterpret_cast<const void*>(address),
+                destination,
+                size,
+                &bytesRead) != FALSE &&
+            bytesRead == size;
+    }
+
     auto readPointer(
         std::uintptr_t address) -> std::uintptr_t
     {
         std::uintptr_t value = 0;
 
-        std::memcpy(
+        tryReadMemory(
+            address,
             &value,
-            reinterpret_cast<const void*>(address),
             sizeof(value));
 
         return value;
@@ -339,12 +359,14 @@ namespace
                     // followed by the size of that allocation.
                     std::uint32_t delegateSize = 0;
 
-                    std::memcpy(
+                    if (!tryReadMemory(
+                        address +
+                            sizeof(std::uintptr_t),
                         &delegateSize,
-                        reinterpret_cast<const void*>(
-                            address +
-                            sizeof(std::uintptr_t)),
-                        sizeof(delegateSize));
+                        sizeof(delegateSize)))
+                    {
+                        continue;
+                    }
 
                     if (delegateSize >= 24 &&
                         delegateSize <= 128)
@@ -443,43 +465,85 @@ namespace
             if (memory.State == MEM_COMMIT &&
                 protectionCanBeWritten(memory.Protect))
             {
-                std::uintptr_t address =
-                    (regionStart + 7) &
-                    ~static_cast<std::uintptr_t>(7);
+                const std::size_t pageSize =
+                    std::max<std::size_t>(
+                        systemInformation.dwPageSize,
+                        sizeof(std::uintptr_t));
 
-                for (;
-                     address + sizeof(std::uintptr_t) <= regionEnd;
-                     address += sizeof(std::uintptr_t))
+                // I snapshot one page at a time before scanning it. Unreal is
+                // free to reshape its heaps while Limelight works, but a page
+                // that disappears simply gets skipped and can no longer take
+                // the whole game down with an access violation.
+                for (std::uintptr_t pageStart = regionStart;
+                     pageStart < regionEnd;)
                 {
-                    if (readPointer(address) !=
-                        mountFunctionAddress)
+                    const std::size_t pageLength =
+                        static_cast<std::size_t>(
+                            std::min<std::uintptr_t>(
+                                pageSize,
+                                regionEnd - pageStart));
+
+                    std::vector<std::uint8_t> snapshot(pageLength);
+
+                    if (!tryReadMemory(
+                            pageStart,
+                            snapshot.data(),
+                            snapshot.size()))
                     {
+                        pageStart += pageLength;
                         continue;
                     }
 
-                    ++result.methodHits;
+                    std::uintptr_t address =
+                        (pageStart + 7) &
+                        ~static_cast<std::uintptr_t>(7);
 
-                    // Walk backwards from the method pointer until the
-                    // delegate's vtable is found. The owner sits immediately
-                    // before the raw member-function pointer.
-                    for (std::size_t methodOffset = 16;
-                         methodOffset <= 96;
-                         methodOffset += sizeof(std::uintptr_t))
+                    for (;
+                         address + sizeof(std::uintptr_t) <=
+                             pageStart + pageLength;
+                         address += sizeof(std::uintptr_t))
                     {
-                        if (address <
-                            regionStart + methodOffset)
+                        std::uintptr_t value = 0;
+                        const std::size_t snapshotOffset =
+                            static_cast<std::size_t>(
+                                address - pageStart);
+
+                        std::memcpy(
+                            &value,
+                            snapshot.data() + snapshotOffset,
+                            sizeof(value));
+
+                        if (value != mountFunctionAddress)
                         {
                             continue;
                         }
 
-                        addMountOwnerCandidate(
-                            image,
-                            address - methodOffset,
-                            mountFunctionAddress,
-                            methodOffset +
-                                sizeof(std::uintptr_t),
-                            result.candidates);
+                        ++result.methodHits;
+
+                        // Walk backwards from the method pointer until the
+                        // delegate's vtable is found. The owner sits directly
+                        // before the raw member-function pointer.
+                        for (std::size_t methodOffset = 16;
+                             methodOffset <= 96;
+                             methodOffset += sizeof(std::uintptr_t))
+                        {
+                            if (address <
+                                regionStart + methodOffset)
+                            {
+                                continue;
+                            }
+
+                            addMountOwnerCandidate(
+                                image,
+                                address - methodOffset,
+                                mountFunctionAddress,
+                                methodOffset +
+                                    sizeof(std::uintptr_t),
+                                result.candidates);
+                        }
                     }
+
+                    pageStart += pageLength;
                 }
             }
 
