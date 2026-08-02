@@ -2,11 +2,16 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -23,6 +28,27 @@ namespace
     };
 
     std::optional<MountResolverResult> cachedResolver;
+
+    constexpr std::uint32_t resolverCacheFormatVersion = 1;
+    constexpr std::size_t resolverSignatureSize = 24;
+
+    struct ResolverCacheRecord
+    {
+        std::array<char, 8> magic{
+            'L', 'M', 'R', 'E', 'S', '1', '\0', '\0'};
+        std::uint32_t formatVersion{
+            resolverCacheFormatVersion};
+        std::uint32_t imageTimestamp{};
+        std::uint32_t imageSize{};
+        std::uint32_t imageChecksum{};
+        std::uint64_t mountRva{};
+        std::uint64_t unmountRva{};
+        std::uint32_t methodOffset{};
+        std::array<std::uint8_t, resolverSignatureSize>
+            mountSignature{};
+        std::array<std::uint8_t, resolverSignatureSize>
+            unmountSignature{};
+    };
 
     auto protectionCanBeRead(
         DWORD protection) -> bool
@@ -924,6 +950,310 @@ namespace
 
         return output.str();
     }
+
+    auto getResolverCachePath() ->
+        std::optional<std::filesystem::path>
+    {
+        std::array<wchar_t, 32768> localAppData{};
+
+        const DWORD length = GetEnvironmentVariableW(
+            L"LOCALAPPDATA",
+            localAppData.data(),
+            static_cast<DWORD>(localAppData.size()));
+
+        if (length == 0 ||
+            length >= localAppData.size())
+        {
+            return std::nullopt;
+        }
+
+        return
+            std::filesystem::path(localAppData.data()) /
+            L"Limelight" /
+            L"Cache" /
+            L"native-resolver-v1.cache";
+    }
+
+    auto cacheRecordMatchesImage(
+        const ResolverCacheRecord& record,
+        const ImageView& image) -> bool
+    {
+        const std::array<char, 8> expectedMagic{
+            'L', 'M', 'R', 'E', 'S', '1', '\0', '\0'};
+
+        if (record.magic != expectedMagic ||
+            record.formatVersion != resolverCacheFormatVersion)
+        {
+            return false;
+        }
+
+        if (record.imageTimestamp !=
+                image.headers->FileHeader.TimeDateStamp ||
+            record.imageSize !=
+                image.headers->OptionalHeader.SizeOfImage ||
+            record.imageChecksum !=
+                image.headers->OptionalHeader.CheckSum)
+        {
+            return false;
+        }
+
+        if (record.methodOffset < 16 ||
+            record.methodOffset > 96 ||
+            record.methodOffset % sizeof(std::uintptr_t) != 0)
+        {
+            return false;
+        }
+
+        const auto signatureFits =
+            [&image](std::uint64_t rva) -> bool
+            {
+                const std::uint64_t imageSize =
+                    image.headers->OptionalHeader.SizeOfImage;
+
+                return
+                    rva < imageSize &&
+                    resolverSignatureSize <= imageSize - rva;
+            };
+
+        if (!signatureFits(record.mountRva) ||
+            !signatureFits(record.unmountRva))
+        {
+            return false;
+        }
+
+        const std::uint8_t* mountAddress =
+            image.base + record.mountRva;
+
+        const std::uint8_t* unmountAddress =
+            image.base + record.unmountRva;
+
+        return
+            std::memcmp(
+                mountAddress,
+                record.mountSignature.data(),
+                resolverSignatureSize) == 0 &&
+            std::memcmp(
+                unmountAddress,
+                record.unmountSignature.data(),
+                resolverSignatureSize) == 0;
+    }
+
+    auto readResolverCache(
+        const ImageView& image) ->
+        std::optional<ResolverCacheRecord>
+    {
+        try
+        {
+            const auto cachePath =
+                getResolverCachePath();
+
+            if (!cachePath.has_value())
+            {
+                return std::nullopt;
+            }
+
+            std::ifstream input(
+                *cachePath,
+                std::ios::binary);
+
+            if (!input)
+            {
+                return std::nullopt;
+            }
+
+            ResolverCacheRecord record;
+
+            input.read(
+                reinterpret_cast<char*>(&record),
+                sizeof(record));
+
+            if (!input ||
+                input.peek() !=
+                    std::ifstream::traits_type::eof())
+            {
+                return std::nullopt;
+            }
+
+            if (!cacheRecordMatchesImage(record, image))
+            {
+                return std::nullopt;
+            }
+
+            return record;
+        }
+        catch (...)
+        {
+            // A cache problem should never stop the Live Loader. I simply
+            // let the normal resolver perform a fresh scan instead.
+            return std::nullopt;
+        }
+    }
+
+    auto writeResolverCache(
+        const ImageView& image,
+        const void* mountFunction,
+        const void* unmountFunction,
+        std::size_t methodOffset) -> void
+    {
+        try
+        {
+            const auto cachePath =
+                getResolverCachePath();
+
+            if (!cachePath.has_value())
+            {
+                return;
+            }
+
+            std::filesystem::create_directories(
+                cachePath->parent_path());
+
+            ResolverCacheRecord record;
+            record.imageTimestamp =
+                image.headers->FileHeader.TimeDateStamp;
+            record.imageSize =
+                image.headers->OptionalHeader.SizeOfImage;
+            record.imageChecksum =
+                image.headers->OptionalHeader.CheckSum;
+            record.mountRva =
+                reinterpret_cast<std::uintptr_t>(mountFunction) -
+                image.start;
+            record.unmountRva =
+                reinterpret_cast<std::uintptr_t>(unmountFunction) -
+                image.start;
+            record.methodOffset =
+                static_cast<std::uint32_t>(methodOffset);
+
+            std::memcpy(
+                record.mountSignature.data(),
+                mountFunction,
+                resolverSignatureSize);
+
+            std::memcpy(
+                record.unmountSignature.data(),
+                unmountFunction,
+                resolverSignatureSize);
+
+            std::filesystem::path temporaryPath =
+                *cachePath;
+            temporaryPath += L".tmp";
+
+            std::ofstream output(
+                temporaryPath,
+                std::ios::binary | std::ios::trunc);
+
+            if (!output)
+            {
+                return;
+            }
+
+            output.write(
+                reinterpret_cast<const char*>(&record),
+                sizeof(record));
+            output.flush();
+
+            if (!output)
+            {
+                return;
+            }
+
+            output.close();
+
+            if (!MoveFileExW(
+                    temporaryPath.c_str(),
+                    cachePath->c_str(),
+                    MOVEFILE_REPLACE_EXISTING |
+                        MOVEFILE_WRITE_THROUGH))
+            {
+                std::error_code ignored;
+                std::filesystem::remove(
+                    temporaryPath,
+                    ignored);
+            }
+        }
+        catch (...)
+        {
+            // The resolver already succeeded, so a cache write failure is
+            // not important enough to interrupt the current game launch.
+        }
+    }
+
+    auto tryResolveFromPersistentCache(
+        const ImageView& image,
+        const ResolverCacheRecord& record) ->
+        std::optional<MountResolverResult>
+    {
+        std::uint8_t* mountFunction =
+            image.base +
+                static_cast<std::size_t>(record.mountRva);
+        std::uint8_t* unmountFunction =
+            image.base +
+                static_cast<std::size_t>(record.unmountRva);
+
+        if (findFunctionSize(image, mountFunction) == 0 ||
+            findFunctionSize(image, unmountFunction) == 0)
+        {
+            return std::nullopt;
+        }
+
+        std::vector<MountOwnerCandidate> ownerCandidates =
+            findMountOwnerCandidates(
+                image,
+                mountFunction);
+
+        std::size_t processMethodHits = 0;
+
+        if (ownerCandidates.empty())
+        {
+            ProcessOwnerScan processScan =
+                findMountOwnerCandidatesProcessWide(
+                    image,
+                    mountFunction);
+
+            processMethodHits =
+                processScan.methodHits;
+            ownerCandidates =
+                std::move(processScan.candidates);
+        }
+
+        if (ownerCandidates.size() != 1 ||
+            ownerCandidates.front().methodOffset !=
+                record.methodOffset)
+        {
+            return std::nullopt;
+        }
+
+        const MountOwnerCandidate& owner =
+            ownerCandidates.front();
+
+        std::ostringstream message;
+        message
+            << "Persistent resolver cache accepted"
+            << "; mount="
+            << formatRva(image, mountFunction)
+            << "; unmount="
+            << formatRva(image, unmountFunction)
+            << "; owner="
+            << formatAddress(owner.platformFile)
+            << "; methodOffset="
+            << owner.methodOffset
+            << "; processMethodHits="
+            << processMethodHits;
+
+        MountResolverResult result{
+            true,
+            message.str()
+        };
+
+        result.platformFile =
+            owner.platformFile;
+        result.mountFunction =
+            mountFunction;
+        result.unmountFunction =
+            unmountFunction;
+
+        return result;
+    }
 }
 
 auto resolveMountFunctions() -> MountResolverResult
@@ -941,6 +1271,25 @@ auto resolveMountFunctions() -> MountResolverResult
             false,
             "The Dead as Disco executable could not be inspected"
         };
+    }
+
+    // I try the verified cache before repeating the expensive marker and
+    // cross-reference scan. The live platform-file owner is still found
+    // again below, so no process address is trusted between game launches.
+    if (const auto cache = readResolverCache(image);
+        cache.has_value())
+    {
+        if (auto cachedResult =
+                tryResolveFromPersistentCache(
+                    image,
+                    *cache);
+            cachedResult.has_value())
+        {
+            cachedResolver =
+                *cachedResult;
+
+            return *cachedResult;
+        }
     }
 
     std::uint8_t* mountText =
@@ -1139,6 +1488,14 @@ auto resolveMountFunctions() -> MountResolverResult
 
     result.unmountFunction =
         unmountFunction;
+
+    // I only save code locations and the verified owner layout. Live heap
+    // addresses are rediscovered on every launch and never enter this file.
+    writeResolverCache(
+        image,
+        mountFunction,
+        unmountFunction,
+        owner.methodOffset);
 
     // These addresses remain valid until the game process closes, so keep
     // them ready for every live mount after the first successful scan.
