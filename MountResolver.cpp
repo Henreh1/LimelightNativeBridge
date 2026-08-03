@@ -29,13 +29,13 @@ namespace
 
     std::optional<MountResolverResult> cachedResolver;
 
-    constexpr std::uint32_t resolverCacheFormatVersion = 1;
+    constexpr std::uint32_t resolverCacheFormatVersion = 2;
     constexpr std::size_t resolverSignatureSize = 24;
 
     struct ResolverCacheRecord
     {
         std::array<char, 8> magic{
-            'L', 'M', 'R', 'E', 'S', '1', '\0', '\0'};
+            'L', 'M', 'R', 'E', 'S', '2', '\0', '\0'};
         std::uint32_t formatVersion{
             resolverCacheFormatVersion};
         std::uint32_t imageTimestamp{};
@@ -444,7 +444,8 @@ namespace
 
     auto findMountOwnerCandidatesProcessWide(
         const ImageView& image,
-        std::uint8_t* mountFunction) -> ProcessOwnerScan
+        std::uint8_t* mountFunction,
+        bool privateMemoryOnly = false) -> ProcessOwnerScan
     {
         ProcessOwnerScan result;
 
@@ -489,6 +490,7 @@ namespace
                         memory.RegionSize);
 
             if (memory.State == MEM_COMMIT &&
+                (!privateMemoryOnly || memory.Type == MEM_PRIVATE) &&
                 protectionCanBeWritten(memory.Protect))
             {
                 const std::size_t pageSize =
@@ -971,7 +973,7 @@ namespace
             std::filesystem::path(localAppData.data()) /
             L"Limelight" /
             L"Cache" /
-            L"native-resolver-v1.cache";
+            L"native-resolver-v2.cache";
     }
 
     auto cacheRecordMatchesImage(
@@ -979,7 +981,7 @@ namespace
         const ImageView& image) -> bool
     {
         const std::array<char, 8> expectedMagic{
-            'L', 'M', 'R', 'E', 'S', '1', '\0', '\0'};
+            'L', 'M', 'R', 'E', 'S', '2', '\0', '\0'};
 
         if (record.magic != expectedMagic ||
             record.formatVersion != resolverCacheFormatVersion)
@@ -1196,25 +1198,18 @@ namespace
             return std::nullopt;
         }
 
-        std::vector<MountOwnerCandidate> ownerCandidates =
-            findMountOwnerCandidates(
+        // I only inspect writable private allocations on the cached path.
+        // This confirms the live owner without repeating the full scan.
+        ProcessOwnerScan processScan =
+            findMountOwnerCandidatesProcessWide(
                 image,
-                mountFunction);
+                mountFunction,
+                true);
 
-        std::size_t processMethodHits = 0;
-
-        if (ownerCandidates.empty())
-        {
-            ProcessOwnerScan processScan =
-                findMountOwnerCandidatesProcessWide(
-                    image,
-                    mountFunction);
-
-            processMethodHits =
-                processScan.methodHits;
-            ownerCandidates =
-                std::move(processScan.candidates);
-        }
+        std::size_t processMethodHits =
+            processScan.methodHits;
+        std::vector<MountOwnerCandidate> ownerCandidates =
+            std::move(processScan.candidates);
 
         if (ownerCandidates.size() != 1 ||
             ownerCandidates.front().methodOffset !=
