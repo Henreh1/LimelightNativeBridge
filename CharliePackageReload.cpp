@@ -162,9 +162,16 @@ namespace
         // I only release a generation after Limelight has verified the new
         // player mesh and its materials. This keeps a failed handoff rooted
         // and turns it into a safe restart instead of a render-thread crash.
-        if (!oldest.replacementConfirmed ||
-            now - oldest.retiredAt <
-            MinimumRetirementAge)
+        // If the game never confirmed a handoff, I allow one bounded
+        // fallback once it has clearly aged out so deadlocks don't accumulate
+        // after many successful swaps.
+        const auto age =
+            now - oldest.retiredAt;
+
+        if ((!oldest.replacementConfirmed &&
+             age < MaximumRetirementAge) ||
+            (oldest.replacementConfirmed &&
+             age < MinimumRetirementAge))
         {
             return false;
         }
@@ -173,7 +180,7 @@ namespace
 
         if (!oldest.rootedObjects.empty())
         {
-            return false;
+            return !oldest.replacementConfirmed;
         }
 
         retiredPackageGenerations.pop_front();
@@ -808,8 +815,21 @@ auto getPackageRetirementStatus()
 
     if (!oldest.replacementConfirmed)
     {
+        if (age >= MaximumRetirementAge)
+        {
+            return status;
+        }
+
         status.ready = false;
-        status.retryAfterMilliseconds = 1000;
+        const auto wait =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                MaximumRetirementAge - age);
+
+        status.retryAfterMilliseconds =
+            static_cast<std::uint32_t>(
+                std::max<std::int64_t>(
+                    1,
+                    wait.count()));
         return status;
     }
 
@@ -867,9 +887,11 @@ auto cleanupRetiredPackages()
         RetiredPackageGeneration& oldest =
             retiredPackageGenerations.front();
 
-        if (!oldest.replacementConfirmed ||
-            now - oldest.retiredAt <
-            MaximumRetirementAge)
+        const auto age =
+            now - oldest.retiredAt;
+
+        if (!oldest.replacementConfirmed &&
+            age < MaximumRetirementAge)
         {
             break;
         }
