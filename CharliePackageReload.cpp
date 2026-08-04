@@ -29,9 +29,11 @@ namespace
     constexpr std::size_t MaxRetiredGenerations = 4;
     constexpr std::size_t RetainedGenerationFloor = 2;
     constexpr auto MinimumRetirementAge =
-        std::chrono::seconds(12);
+        // I keep confirmed generations alive longer so streamed textures and
+        // replaced materials have enough time to stop referencing old data.
+        std::chrono::seconds(20);
     constexpr auto MaximumRetirementAge =
-        std::chrono::seconds(60);
+        std::chrono::seconds(120);
 
     struct RetiredPackageGeneration
     {
